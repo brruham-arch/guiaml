@@ -554,6 +554,11 @@ static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
         ImGui::GetIO().DisplaySize = ImVec2((float)w, (float)h);
 
         render_gui();
+
+        // Restore GL state — jangan tinggalkan state kotor untuk game
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        glDisable(GL_BLEND);
     }
 
     return orig_eglSwapBuffers(dpy, surf);
@@ -610,21 +615,33 @@ EXPORT void OnModLoad() {
     int r = hook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
     if (r != 0) { _log("[GUIAML] ERROR: hook failed r=%d", r); return; }
 
-    // ── Hook AND_TouchEvent di libGTASA.so offset 0x2697C0 ──────────────
-    void* hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!hGTASA) hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_GLOBAL);
-    if (hGTASA) {
-        uintptr_t base    = (uintptr_t)hGTASA;
-        // Thumb2: bit0=1, jadi target = base + offset | 1
-        // Dobby handle Thumb otomatis — cukup berikan alamat genap
-        void* addr_touch  = (void*)(base + 0x2697C0);
-        _log("[GUIAML] AND_TouchEvent base=%p addr=%p", (void*)base, addr_touch);
+    // ── Hook AND_TouchEvent — cari base libGTASA.so dari /proc/self/maps ──
+    uintptr_t gtasa_base = 0;
+    {
+        FILE* maps = fopen("/proc/self/maps", "r");
+        if (maps) {
+            char line[512];
+            while (fgets(line, sizeof(line), maps)) {
+                if (strstr(line, "libGTASA.so") && strstr(line, "r-xp")) {
+                    gtasa_base = (uintptr_t)strtoul(line, nullptr, 16);
+                    break;
+                }
+            }
+            fclose(maps);
+        }
+    }
+    _log("[GUIAML] libGTASA.so base from maps = 0x%08X", (unsigned)gtasa_base);
+
+    if (gtasa_base) {
+        // offset dari nm output: 0x2697C0, Thumb2 → berikan genap ke Dobby
+        void* addr_touch = (void*)(gtasa_base + 0x2697C0);
+        _log("[GUIAML] AND_TouchEvent target = %p", addr_touch);
         int rt = hook(addr_touch, (void*)hook_AND_TouchEvent,
                       (void**)&orig_AND_TouchEvent);
         if (rt == 0) _log("[GUIAML] AND_TouchEvent hooked OK");
         else         _log("[GUIAML] WARN: AND_TouchEvent hook failed r=%d", rt);
     } else {
-        _log("[GUIAML] WARN: libGTASA.so handle not found");
+        _log("[GUIAML] WARN: libGTASA.so base not found in maps");
     }
 
     _log("[GUIAML] OK — GUI aktif di frame pertama");
