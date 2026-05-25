@@ -50,6 +50,11 @@ typedef void*(*DobbyResolver_t)(const char*, const char*);
 static bool g_init    = false;
 static bool g_visible = true;
 
+// EGL context tracking — untuk detect re-create saat transisi loading→world
+static EGLDisplay g_last_display = EGL_NO_DISPLAY;
+static EGLSurface g_last_surface = EGL_NO_SURFACE;
+static EGLContext g_last_context  = EGL_NO_CONTEXT;
+
 // Touch
 struct Touch { float x, y; bool down; };
 static Touch            g_touch = {};
@@ -405,6 +410,15 @@ done:
 //  ImGui init (dipanggil di frame pertama)
 // ─────────────────────────────────────────────────────────────────────────────
 
+static void do_shutdown() {
+    if (g_init) {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui::DestroyContext();
+        g_init = false;
+        _log("[GUIAML] Context destroyed, will re-init");
+    }
+}
+
 static void do_init(EGLDisplay dpy, EGLSurface surf) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -462,8 +476,22 @@ static void do_init(EGLDisplay dpy, EGLSurface surf) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (!g_init) do_init(dpy, surf);
-    render_gui();
+    EGLContext ctx = eglGetCurrentContext();
+
+    // Context berubah (transisi loading->world) = shutdown + re-init
+    if (ctx != g_last_context || dpy != g_last_display || surf != g_last_surface) {
+        do_shutdown();
+        g_last_display = dpy;
+        g_last_surface = surf;
+        g_last_context = ctx;
+    }
+
+    if (!g_init && ctx != EGL_NO_CONTEXT) {
+        do_init(dpy, surf);
+    }
+
+    if (g_init) render_gui();
+
     return orig_eglSwapBuffers(dpy, surf);
 }
 
