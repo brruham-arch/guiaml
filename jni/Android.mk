@@ -29,7 +29,8 @@ LOCAL_CPPFLAGS := \
     -DIMGUI_DISABLE_DEMO_WINDOWS \
     -DIMGUI_USER_CONFIG="\"imconfig.h\""
 
-LOCAL_LDLIBS := \ -landroid
+LOCAL_LDLIBS := \
+    -landroid \
     -llog \
     -lm \
     -ldl \
