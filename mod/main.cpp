@@ -50,10 +50,16 @@ typedef int32_t (*fnGetEvent_t)(AInputQueue*, AInputEvent**);
 typedef void    (*fnFinishEvent_t)(AInputQueue*, AInputEvent*, int);
 static fnGetEvent_t    orig_getEvent = nullptr;
 
-// rect window ImGui — di-update tiap frame, dicek di input thread
 struct WinRect { float x,y,w,h; };
 static WinRect         g_win_rect   = {};
 static pthread_mutex_t g_rect_mu    = PTHREAD_MUTEX_INITIALIZER;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ImGui state
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool g_init    = false;
+static bool g_visible = true;
 
 static bool touch_in_gui(float x, float y) {
     if (!g_init || !g_visible) return false;
@@ -62,13 +68,6 @@ static bool touch_in_gui(float x, float y) {
     pthread_mutex_unlock(&g_rect_mu);
     return (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  ImGui state
-// ─────────────────────────────────────────────────────────────────────────────
-
-static bool g_init    = false;
-static bool g_visible = true;
 
 // EGL context tracking — untuk detect re-create saat transisi loading→world
 static EGLDisplay g_last_display = EGL_NO_DISPLAY;
