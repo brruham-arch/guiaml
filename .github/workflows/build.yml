@@ -1,0 +1,62 @@
+name: Build libguiaml
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup NDK r25c
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
+      - name: Download ImGui 1.89.9
+        run: |
+          wget -q https://github.com/ocornut/imgui/archive/refs/tags/v1.89.9.tar.gz
+          tar xf v1.89.9.tar.gz
+          cp imgui-1.89.9/imgui.h                              include/imgui/
+          cp imgui-1.89.9/imgui_internal.h                     include/imgui/
+          cp imgui-1.89.9/imstb_rectpack.h                     include/imgui/
+          cp imgui-1.89.9/imstb_textedit.h                     include/imgui/
+          cp imgui-1.89.9/imstb_truetype.h                     include/imgui/
+          cp imgui-1.89.9/imgui.cpp                            include/imgui/
+          cp imgui-1.89.9/imgui_draw.cpp                       include/imgui/
+          cp imgui-1.89.9/imgui_tables.cpp                     include/imgui/
+          cp imgui-1.89.9/imgui_widgets.cpp                    include/imgui/
+          cp imgui-1.89.9/backends/imgui_impl_opengl3.h        include/imgui/
+          cp imgui-1.89.9/backends/imgui_impl_opengl3.cpp      include/imgui/
+          cp imgui-1.89.9/backends/imgui_impl_opengl3_loader.h include/imgui/
+          rm -rf imgui-1.89.9 v1.89.9.tar.gz
+          echo "=== ImGui files ==="
+          ls include/imgui/
+
+      - name: Build
+        run: |
+          $ANDROID_NDK_ROOT/ndk-build \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=./jni/Android.mk \
+            NDK_APPLICATION_MK=./jni/Application.mk \
+            -j$(nproc)
+
+      - name: Verify
+        run: |
+          ls -lh libs/armeabi-v7a/
+          file libs/armeabi-v7a/libguiaml.so
+          $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm \
+            -D libs/armeabi-v7a/libguiaml.so | grep " T "
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: libguiaml-arm32
+          path: libs/armeabi-v7a/libguiaml.so
+          retention-days: 14
