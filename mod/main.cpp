@@ -45,7 +45,7 @@ typedef int  (*DobbyHook_t)(void*, void*, void**);
 typedef void*(*DobbyResolver_t)(const char*, const char*);
 
 // touch hook — AND_TouchEvent(action, x, y, pointerId) di libGTASA.so
-typedef void (*AND_TouchEvent_t)(int, int, int, int);
+typedef void (*AND_TouchEvent_t)(int action, int x, int y, int pointerId);
 static AND_TouchEvent_t orig_AND_TouchEvent = nullptr;
 
 struct WinRect { float x,y,w,h; };
@@ -609,6 +609,23 @@ EXPORT void OnModLoad() {
 
     int r = hook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
     if (r != 0) { _log("[GUIAML] ERROR: hook failed r=%d", r); return; }
+
+    // ── Hook AND_TouchEvent di libGTASA.so offset 0x2697C0 ──────────────
+    void* hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!hGTASA) hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_GLOBAL);
+    if (hGTASA) {
+        uintptr_t base    = (uintptr_t)hGTASA;
+        // Thumb2: bit0=1, jadi target = base + offset | 1
+        // Dobby handle Thumb otomatis — cukup berikan alamat genap
+        void* addr_touch  = (void*)(base + 0x2697C0);
+        _log("[GUIAML] AND_TouchEvent base=%p addr=%p", (void*)base, addr_touch);
+        int rt = hook(addr_touch, (void*)hook_AND_TouchEvent,
+                      (void**)&orig_AND_TouchEvent);
+        if (rt == 0) _log("[GUIAML] AND_TouchEvent hooked OK");
+        else         _log("[GUIAML] WARN: AND_TouchEvent hook failed r=%d", rt);
+    } else {
+        _log("[GUIAML] WARN: libGTASA.so handle not found");
+    }
 
     _log("[GUIAML] OK — GUI aktif di frame pertama");
 }
