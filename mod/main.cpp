@@ -14,7 +14,6 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <android/log.h>
-#include <android/input.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 
@@ -45,10 +44,9 @@ static eglSwapBuffers_t orig_eglSwapBuffers = nullptr;
 typedef int  (*DobbyHook_t)(void*, void*, void**);
 typedef void*(*DobbyResolver_t)(const char*, const char*);
 
-// touch hook
-typedef int32_t (*fnGetEvent_t)(AInputQueue*, AInputEvent**);
-typedef void    (*fnFinishEvent_t)(AInputQueue*, AInputEvent*, int);
-static fnGetEvent_t    orig_getEvent = nullptr;
+// touch hook — AND_TouchEvent(action, x, y, pointerId) di libGTASA.so
+typedef void (*AND_TouchEvent_t)(int, int, int, int);
+static AND_TouchEvent_t orig_AND_TouchEvent = nullptr;
 
 struct WinRect { float x,y,w,h; };
 static WinRect         g_win_rect   = {};
@@ -169,34 +167,21 @@ static void StatusDot(const char* label, bool on) {
 //  GUI Render
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int32_t hook_getEvent(AInputQueue* q, AInputEvent** ev) {
-    int32_t ret = orig_getEvent(q, ev);
-    if (ret < 0 || !*ev) return ret;
+static void hook_AND_TouchEvent(int action, int x, int y, int ptr) {
+    float fx = (float)x, fy = (float)y;
 
-    if (AInputEvent_getType(*ev) == AINPUT_EVENT_TYPE_MOTION) {
-        int32_t action = AMotionEvent_getAction(*ev) & AMOTION_EVENT_ACTION_MASK;
-        float x = AMotionEvent_getX(*ev, 0);
-        float y = AMotionEvent_getY(*ev, 0);
+    pthread_mutex_lock(&g_mu);
+    g_touch.x    = fx;
+    g_touch.y    = fy;
+    g_touch.down = (action == 0 || action == 2); // 0=DOWN 2=MOVE
+    pthread_mutex_unlock(&g_mu);
 
-        pthread_mutex_lock(&g_mu);
-        g_touch.x    = x;
-        g_touch.y    = y;
-        g_touch.down = (action == AMOTION_EVENT_ACTION_DOWN ||
-                        action == AMOTION_EVENT_ACTION_MOVE);
-        pthread_mutex_unlock(&g_mu);
-
-        _log("[TOUCH] action=%d x=%.0f y=%.0f in_gui=%d", action, x, y, touch_in_gui(x,y)?1:0);
-
-        if (touch_in_gui(x, y)) {
-            static fnFinishEvent_t s_fin = nullptr;
-            if (!s_fin) {
-                void* h = dlopen("libandroid.so", RTLD_NOW);
-                if (h) s_fin = (fnFinishEvent_t)dlsym(h, "AInputQueue_finishEvent");
-            }
-            if (s_fin) { s_fin(q, *ev, 1); return -1; }
-        }
+    // Block kalau touch di dalam GUI window
+    if (touch_in_gui(fx, fy)) {
+        _log("[TOUCH] consumed action=%d x=%d y=%d", action, x, y);
+        return;
     }
-    return ret;
+    orig_AND_TouchEvent(action, x, y, ptr);
 }
 
 static void render_gui() {
