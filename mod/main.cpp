@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <android/log.h>
+#include <android/input.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 
@@ -42,6 +43,12 @@ static eglSwapBuffers_t orig_eglSwapBuffers = nullptr;
 
 typedef int  (*DobbyHook_t)(void*, void*, void**);
 typedef void*(*DobbyResolver_t)(const char*, const char*);
+
+// touch hook
+typedef int32_t (*fnGetEvent_t)(AInputQueue*, AInputEvent**);
+typedef void    (*fnFinishEvent_t)(AInputQueue*, AInputEvent*, int);
+static fnGetEvent_t  orig_getEvent  = nullptr;
+static bool          g_want_capture = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ImGui state
@@ -149,6 +156,35 @@ static void StatusDot(const char* label, bool on) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  GUI Render
 // ─────────────────────────────────────────────────────────────────────────────
+
+static int32_t hook_getEvent(AInputQueue* q, AInputEvent** ev) {
+    int32_t ret = orig_getEvent(q, ev);
+    if (ret < 0 || !*ev) return ret;
+
+    if (AInputEvent_getType(*ev) == AINPUT_EVENT_TYPE_MOTION) {
+        int32_t action = AMotionEvent_getAction(*ev) & AMOTION_EVENT_ACTION_MASK;
+        float x = AMotionEvent_getX(*ev, 0);
+        float y = AMotionEvent_getY(*ev, 0);
+
+        pthread_mutex_lock(&g_mu);
+        g_touch.x    = x;
+        g_touch.y    = y;
+        g_touch.down = (action == AMOTION_EVENT_ACTION_DOWN ||
+                        action == AMOTION_EVENT_ACTION_MOVE);
+        pthread_mutex_unlock(&g_mu);
+
+        // Consume agar game tidak ikut proses tap saat GUI aktif
+        if (g_want_capture && g_visible) {
+            static fnFinishEvent_t s_fin = nullptr;
+            if (!s_fin) {
+                void* h = dlopen("libandroid.so", RTLD_NOW);
+                if (h) s_fin = (fnFinishEvent_t)dlsym(h, "AInputQueue_finishEvent");
+            }
+            if (s_fin) { s_fin(q, *ev, 1); return -1; }
+        }
+    }
+    return ret;
+}
 
 static void render_gui() {
     ImGuiIO& io = ImGui::GetIO();
@@ -403,6 +439,7 @@ static void render_gui() {
 
 done:
     ImGui::Render();
+    g_want_capture = ImGui::GetIO().WantCaptureMouse;
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }
 
