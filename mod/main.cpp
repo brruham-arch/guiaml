@@ -20,6 +20,7 @@
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_opengl3.h"
+#include "imgui/imgui_internal.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 #define LOG_TAG "libguiaml"
@@ -47,8 +48,20 @@ typedef void*(*DobbyResolver_t)(const char*, const char*);
 // touch hook
 typedef int32_t (*fnGetEvent_t)(AInputQueue*, AInputEvent**);
 typedef void    (*fnFinishEvent_t)(AInputQueue*, AInputEvent*, int);
-static fnGetEvent_t  orig_getEvent  = nullptr;
-static bool          g_want_capture = false;
+static fnGetEvent_t    orig_getEvent = nullptr;
+
+// rect window ImGui — di-update tiap frame, dicek di input thread
+struct WinRect { float x,y,w,h; };
+static WinRect         g_win_rect   = {};
+static pthread_mutex_t g_rect_mu    = PTHREAD_MUTEX_INITIALIZER;
+
+static bool touch_in_gui(float x, float y) {
+    if (!g_init || !g_visible) return false;
+    pthread_mutex_lock(&g_rect_mu);
+    WinRect r = g_win_rect;
+    pthread_mutex_unlock(&g_rect_mu);
+    return (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ImGui state
@@ -173,8 +186,9 @@ static int32_t hook_getEvent(AInputQueue* q, AInputEvent** ev) {
                         action == AMOTION_EVENT_ACTION_MOVE);
         pthread_mutex_unlock(&g_mu);
 
-        // Consume agar game tidak ikut proses tap saat GUI aktif
-        if (g_want_capture && g_visible) {
+        _log("[TOUCH] action=%d x=%.0f y=%.0f in_gui=%d", action, x, y, touch_in_gui(x,y)?1:0);
+
+        if (touch_in_gui(x, y)) {
             static fnFinishEvent_t s_fin = nullptr;
             if (!s_fin) {
                 void* h = dlopen("libandroid.so", RTLD_NOW);
@@ -223,6 +237,15 @@ static void render_gui() {
         ImGui::Begin("GUI AML  |  brruham-arch", &p_open,
             ImGuiWindowFlags_NoCollapse);
         if (!p_open) g_visible = false;
+
+        // Update rect cache untuk touch blocking
+        {
+            ImVec2 pos = ImGui::GetWindowPos();
+            ImVec2 sz  = ImGui::GetWindowSize();
+            pthread_mutex_lock(&g_rect_mu);
+            g_win_rect = {pos.x, pos.y, sz.x, sz.y};
+            pthread_mutex_unlock(&g_rect_mu);
+        }
 
         // Status bar
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f,0.12f,0.10f,1));
@@ -439,7 +462,6 @@ static void render_gui() {
 
 done:
     ImGui::Render();
-    g_want_capture = ImGui::GetIO().WantCaptureMouse;
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }
 
