@@ -490,7 +490,28 @@ static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
         do_init(dpy, surf);
     }
 
-    if (g_init) render_gui();
+    if (g_init) {
+        // Pastikan GL state bersih sebelum ImGui render
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_SCISSOR_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        // Bind framebuffer default (0) agar render ke layar, bukan FBO game
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        // Update viewport sesuai surface saat ini
+        EGLint w = 1080, h = 1920;
+        eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
+        eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+        glViewport(0, 0, w, h);
+
+        // Update DisplaySize jika berubah (rotate, resize)
+        ImGui::GetIO().DisplaySize = ImVec2((float)w, (float)h);
+
+        render_gui();
+    }
 
     return orig_eglSwapBuffers(dpy, surf);
 }
