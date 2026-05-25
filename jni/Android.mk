@@ -2,7 +2,7 @@ LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
 
-LOCAL_MODULE    := devshell
+LOCAL_MODULE    := guiaml
 
 LOCAL_SRC_FILES := \
     ../mod/main.cpp \
@@ -15,8 +15,7 @@ LOCAL_SRC_FILES := \
 LOCAL_C_INCLUDES := \
     $(LOCAL_PATH)/../include \
     $(LOCAL_PATH)/../include/imgui \
-    $(LOCAL_PATH)/../include/mod \
-    $(LOCAL_PATH)/../include/AML
+    $(LOCAL_PATH)/../include/mod
 
 LOCAL_CPPFLAGS := \
     -std=c++17 \
@@ -27,7 +26,8 @@ LOCAL_CPPFLAGS := \
     -fdata-sections \
     -mthumb \
     -DIMGUI_IMPL_OPENGL_ES2 \
-    -DIMGUI_DISABLE_DEMO_WINDOWS
+    -DIMGUI_DISABLE_DEMO_WINDOWS \
+    -DIMGUI_USER_CONFIG="\"imconfig.h\""
 
 LOCAL_LDLIBS := \
     -llog \
