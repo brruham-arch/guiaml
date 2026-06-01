@@ -1,15 +1,7 @@
 /**
  * libguiaml.so — ImGui overlay via eglSwapBuffers hook
- * Author  : brruham-arch
- * Fixed   : touch blocking, input feed order, GL state restore
- *
- * BUG LAMA yang sudah diperbaiki:
- *  [1] touch_in_gui() manual rect check → diganti io.WantCaptureMouse (benar)
- *  [2] MousePos/MouseDown di-set SETELAH NewFrame() → dipindah SEBELUM NewFrame()
- *  [3] action==2 (MOVE) dianggap button DOWN → sekarang hanya DOWN/UP yang ubah state
- *  [4] GL state tidak di-save/restore dengan benar → pakai push/pop lengkap
- *  [5] g_touch.down tidak di-reset saat jari lepas (action==1/6) → fixed
- *  [6] WantCaptureMouse tidak pernah dipakai → sekarang jadi penentu utama
+ * v1.2 — AND_TouchEvent hook DINONAKTIFKAN (offset salah = SIGILL)
+ * Touch blocking via AMotionEvent intercept di eglSwapBuffers thread
  */
 
 #include <stdint.h>
@@ -20,6 +12,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <android/log.h>
+#include <android/input.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 
@@ -27,7 +20,6 @@
 #include "imgui_impl_opengl3.h"
 #include "imgui/imgui_internal.h"
 
-// ─────────────────────────────────────────────────────────────────────────────
 #define LOG_TAG  "libguiaml"
 #define LOGFILE  "/storage/emulated/0/guiaml_log.txt"
 #define EXPORT   __attribute__((visibility("default")))
@@ -40,424 +32,196 @@ static void _log(const char* fmt, ...) {
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Tipe fungsi
-// ─────────────────────────────────────────────────────────────────────────────
-
+// ── Tipe ────────────────────────────────────────────────────────────────────
 typedef EGLBoolean (*eglSwapBuffers_t)(EGLDisplay, EGLSurface);
 static eglSwapBuffers_t orig_eglSwapBuffers = nullptr;
 
 typedef int  (*DobbyHook_t)(void*, void*, void**);
 typedef void*(*DobbyResolver_t)(const char*, const char*);
 
-typedef void (*AND_TouchEvent_t)(int action, int x, int y, int pointerId);
-static AND_TouchEvent_t orig_AND_TouchEvent = nullptr;
+// ── Touch state — diisi dari JNI_OnLoad intercept atau fallback ─────────────
+struct TouchEv { float x, y; int action; bool fresh; };
+static TouchEv         g_touch  = {};
+static pthread_mutex_t g_tmu    = PTHREAD_MUTEX_INITIALIZER;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  State touch — diakses dari 2 thread (touch thread & render thread)
-//  Simpan event mentah, diproses saat pre-frame
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct TouchEvent {
-    float x, y;
-    int   action;   // 0=DOWN, 1=UP, 2=MOVE, 5=PTR_DOWN, 6=PTR_UP
-    bool  fresh;    // ada event baru yang belum diproses
-};
-
-static TouchEvent      g_touch  = {};
-static pthread_mutex_t g_touch_mu = PTHREAD_MUTEX_INITIALIZER;
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  State ImGui & EGL
-// ─────────────────────────────────────────────────────────────────────────────
-
+// ── ImGui / EGL ─────────────────────────────────────────────────────────────
 static bool       g_init        = false;
 static bool       g_visible     = true;
+static EGLDisplay g_last_dpy    = EGL_NO_DISPLAY;
+static EGLSurface g_last_surf   = EGL_NO_SURFACE;
+static EGLContext g_last_ctx    = EGL_NO_CONTEXT;
 
-static EGLDisplay g_last_display = EGL_NO_DISPLAY;
-static EGLSurface g_last_surface = EGL_NO_SURFACE;
-static EGLContext g_last_context  = EGL_NO_CONTEXT;
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Widget state
-// ─────────────────────────────────────────────────────────────────────────────
-
-static bool  tog_godmode   = false;
-static bool  tog_noclip    = false;
-static bool  tog_infammo   = false;
-static bool  tog_speedhack = false;
-static int   sl_health     = 100;
-static int   sl_armor      = 0;
-static float sl_speed      = 1.0f;
-static float sl_fov        = 70.0f;
-static bool  cb_esp        = false;
-static bool  cb_aimbot     = false;
-static bool  cb_radar      = true;
-static bool  cb_hud        = true;
-
-static int   combo_wep     = 0;
-static int   sl_ammo       = 9999;
-static bool  cb_infammo_wep = false;
-static const char* k_weapons[] = {
-    "Fists (0)","Pistol (22)","Desert Eagle (24)",
-    "Shotgun (25)","AK-47 (30)","M4 (31)",
-    "MP5 (29)","Sniper (34)","RPG (35)","Minigun (38)"
-};
-
-static float tp_x = 0.0f, tp_y = 0.0f, tp_z = 5.0f;
+// ── Widget state ────────────────────────────────────────────────────────────
+static bool  tog_godmode = false, tog_noclip = false;
+static bool  tog_infammo = false, tog_speed  = false;
+static int   sl_health = 100, sl_armor = 0;
+static float sl_spd = 1.0f, sl_fov = 70.0f;
+static bool  cb_esp = false, cb_radar = true, cb_hud = true;
+static int   combo_wep = 0, sl_ammo = 9999;
+static float tp_x=0,tp_y=0,tp_z=5;
 static bool  cb_freeze = false;
+static float col_esp[4]={1,.3f,.3f,1}, sl_alpha=1.f;
+static char  g_log[8192]="[GUIAML v1.2] Ready - touch via WantCaptureMouse\n";
+static char  g_cmd[256]="";
+static const char* k_wep[]={"Fists","Pistol","Deagle","Shotgun","AK-47","M4","MP5","Sniper","RPG","Minigun"};
 
-static float col_esp[4]   = {1.0f, 0.3f, 0.3f, 1.0f};
-static float col_name[4]  = {1.0f, 1.0f, 1.0f, 1.0f};
-static float sl_ui_alpha  = 1.0f;
-static int   radio_team   = 0;
-static bool  cb_fullbright   = false;
-static bool  cb_nightvision  = false;
-
-static char  g_log[8192] = "[GUIAML] Ready.\n";
-static char  g_cmd[256]  = "";
-
-static void log_ui(const char* fmt, ...) {
-    char tmp[256];
-    va_list ap; va_start(ap, fmt); vsnprintf(tmp, sizeof(tmp), fmt, ap); va_end(ap);
-    size_t rem = sizeof(g_log) - strlen(g_log) - 1;
-    strncat(g_log, tmp, rem);
-    rem = sizeof(g_log) - strlen(g_log) - 1;
-    strncat(g_log, "\n", rem);
+static void log_ui(const char* fmt,...){
+    char t[256]; va_list a; va_start(a,fmt); vsnprintf(t,sizeof(t),fmt,a); va_end(a);
+    size_t r=sizeof(g_log)-strlen(g_log)-1; strncat(g_log,t,r);
+    r=sizeof(g_log)-strlen(g_log)-1; strncat(g_log,"\n",r);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Helpers UI
-// ─────────────────────────────────────────────────────────────────────────────
-
-static bool ToggleBtn(const char* /*id*/, const char* lbl_on, const char* lbl_off,
-                       bool* state, ImVec2 sz = ImVec2(0,0)) {
-    if (*state) {
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f,0.50f,0.35f,1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.10f,0.65f,0.45f,1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.06f,0.38f,0.26f,1));
-        bool hit = ImGui::Button(lbl_on,  sz);
-        ImGui::PopStyleColor(3);
-        if (hit) *state = false;
-        return hit;
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.35f,0.08f,0.08f,1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.50f,0.12f,0.12f,1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.25f,0.06f,0.06f,1));
-        bool hit = ImGui::Button(lbl_off, sz);
-        ImGui::PopStyleColor(3);
-        if (hit) *state = true;
-        return hit;
-    }
+// ── Helper ──────────────────────────────────────────────────────────────────
+static bool TogBtn(const char* lon, const char* loff, bool* s, ImVec2 sz={0,0}){
+    ImVec4 on1={.08f,.50f,.35f,1}, on2={.10f,.65f,.45f,1}, on3={.06f,.38f,.26f,1};
+    ImVec4 of1={.35f,.08f,.08f,1}, of2={.50f,.12f,.12f,1}, of3={.25f,.06f,.06f,1};
+    ImGui::PushStyleColor(ImGuiCol_Button,       *s?on1:of1);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,*s?on2:of2);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, *s?on3:of3);
+    bool h=ImGui::Button(*s?lon:loff,sz); ImGui::PopStyleColor(3);
+    if(h)*s=!*s; return h;
+}
+static void Dot(const char* lbl,bool on){
+    ImGui::TextColored(on?ImVec4(.2f,.9f,.5f,1):ImVec4(.5f,.5f,.5f,1),on?"[ON]":"[OFF]");
+    ImGui::SameLine(); ImGui::Text("%s",lbl);
 }
 
-static void StatusDot(const char* label, bool on) {
-    ImGui::TextColored(
-        on ? ImVec4(0.2f,0.9f,0.5f,1) : ImVec4(0.5f,0.5f,0.5f,1),
-        on ? "[ON]" : "[OFF]");
-    ImGui::SameLine();
-    ImGui::Text("%s", label);
-}
+// ── Feed touch ke ImGui (dipanggil sebelum NewFrame) ────────────────────────
+static void feed_touch(){
+    pthread_mutex_lock(&g_tmu);
+    TouchEv ev=g_touch;
+    if(ev.fresh) g_touch.fresh=false;
+    pthread_mutex_unlock(&g_tmu);
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  [FIX #1] Hook AND_TouchEvent — pakai WantCaptureMouse sebagai gate utama
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void hook_AND_TouchEvent(int action, int x, int y, int ptr) {
-    if (!g_init) {
-        if (orig_AND_TouchEvent) orig_AND_TouchEvent(action, x, y, ptr);
-        return;
-    }
-
-    // Simpan event untuk diproses di render frame berikutnya
-    pthread_mutex_lock(&g_touch_mu);
-    g_touch.x      = (float)x;
-    g_touch.y      = (float)y;
-    g_touch.action = action;
-    g_touch.fresh  = true;
-    pthread_mutex_unlock(&g_touch_mu);
-
-    // *** FIX UTAMA ***
-    // WantCaptureMouse dihitung ImGui berdasarkan posisi touch DAN state frame sebelumnya.
-    // Ini reliable karena ImGui tracking hover/active window internal.
-    // Catatan: WantCaptureMouse valid SETELAH NewFrame() diproses frame sebelumnya.
-    if (g_visible && ImGui::GetIO().WantCaptureMouse) {
-        _log("[TOUCH] consumed action=%d x=%d y=%d", action, x, y);
-        return; // jangan teruskan ke game
-    }
-
-    if (orig_AND_TouchEvent) orig_AND_TouchEvent(action, x, y, ptr);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  [FIX #2 & #3] Feed touch ke ImGui SEBELUM NewFrame()
-//  Dengan AddMousePosEvent/AddMouseButtonEvent (API baru ImGui)
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void feed_touch_to_imgui() {
-    pthread_mutex_lock(&g_touch_mu);
-    TouchEvent ev = g_touch;
-    if (ev.fresh) g_touch.fresh = false;
-    pthread_mutex_unlock(&g_touch_mu);
-
-    if (!ev.fresh) return;
-
-    ImGuiIO& io = ImGui::GetIO();
-
-    // Selalu update posisi mouse
+    if(!ev.fresh) return;
+    ImGuiIO& io=ImGui::GetIO();
     io.AddMousePosEvent(ev.x, ev.y);
-
-    // [FIX #3] Hanya ubah button state saat DOWN atau UP, bukan MOVE
-    switch (ev.action) {
-        case 0: // ACTION_DOWN
-        case 5: // ACTION_POINTER_DOWN
-            io.AddMouseButtonEvent(0, true);
-            break;
-        case 1: // ACTION_UP
-        case 6: // ACTION_POINTER_UP
-            io.AddMouseButtonEvent(0, false);
-            break;
-        case 2: // ACTION_MOVE — hanya update posisi, sudah dilakukan di atas
-        default:
-            break;
+    switch(ev.action){
+        case 0: case 5: io.AddMouseButtonEvent(0,true);  break;
+        case 1: case 6: io.AddMouseButtonEvent(0,false); break;
+        // MOVE (2): hanya update posisi, sudah dilakukan di atas
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  GUI render
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void render_gui() {
-    ImGuiIO& io = ImGui::GetIO();
-
-    // [FIX #2] Feed touch SEBELUM NewFrame — urutan yang benar
-    feed_touch_to_imgui();
+// ── Render GUI ───────────────────────────────────────────────────────────────
+static void render_gui(){
+    feed_touch();  // SEBELUM NewFrame
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
 
-    // ── Floating button saat hidden ──────────────────────────────────────
-    if (!g_visible) {
-        ImGui::SetNextWindowPos(ImVec2(6, 6), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(88, 36), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.80f);
-        ImGui::Begin("##fab", nullptr,
-            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoMove |
+    if(!g_visible){
+        ImGui::SetNextWindowPos({6,6},ImGuiCond_Always);
+        ImGui::SetNextWindowSize({90,36},ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(.82f);
+        ImGui::Begin("##f",nullptr,
+            ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|
+            ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoScrollbar|
             ImGuiWindowFlags_NoSavedSettings);
-        if (ImGui::Button("GUIAML", ImVec2(-1, 0))) g_visible = true;
+        if(ImGui::Button("GUIAML",{-1,0})) g_visible=true;
         ImGui::End();
         goto done;
     }
-
     {
-        float W = io.DisplaySize.x;
-        float H = io.DisplaySize.y;
+        float W=ImGui::GetIO().DisplaySize.x, H=ImGui::GetIO().DisplaySize.y;
+        ImGui::SetNextWindowPos({W*.02f,H*.04f},ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize({W*.58f,H*.88f},ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowBgAlpha(sl_alpha*.96f);
+        bool open=true;
+        ImGui::Begin("GUI AML  |  brruham-arch",&open,ImGuiWindowFlags_NoCollapse);
+        if(!open) g_visible=false;
 
-        ImGui::SetNextWindowPos(ImVec2(W * 0.02f, H * 0.04f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(W * 0.58f, H * 0.88f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowBgAlpha(sl_ui_alpha * 0.96f);
-
-        bool p_open = true;
-        ImGui::Begin("GUI AML  |  brruham-arch", &p_open, ImGuiWindowFlags_NoCollapse);
-        if (!p_open) g_visible = false;
-
-        // Status bar
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.12f, 0.10f, 1));
-        ImGui::BeginChild("##status", ImVec2(-1, 28), false);
+        // Status
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,{.07f,.12f,.10f,1});
+        ImGui::BeginChild("##st",{-1,28},false);
         ImGui::SetCursorPosY(4);
-        StatusDot("God",   tog_godmode);   ImGui::SameLine(0, 10);
-        StatusDot("Clip",  tog_noclip);    ImGui::SameLine(0, 10);
-        StatusDot("Ammo",  tog_infammo);   ImGui::SameLine(0, 10);
-        StatusDot("Speed", tog_speedhack);
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
+        Dot("God",tog_godmode); ImGui::SameLine(0,10);
+        Dot("Clip",tog_noclip); ImGui::SameLine(0,10);
+        Dot("Ammo",tog_infammo); ImGui::SameLine(0,10);
+        Dot("Speed",tog_speed);
+        ImGui::EndChild(); ImGui::PopStyleColor(); ImGui::Spacing();
 
-        if (ImGui::BeginTabBar("##T")) {
+        if(ImGui::BeginTabBar("##T")){
 
-            // ══ TAB: PLAYER ══════════════════════════════════════════════
-            if (ImGui::BeginTabItem("Player")) {
-                ImGui::Spacing();
-                ImGui::Text("Toggles"); ImGui::Separator(); ImGui::Spacing();
-
-                float hw = (ImGui::GetContentRegionAvail().x - 8) * 0.5f;
-                ImVec2 bsz(hw, 0);
-
-                if (ToggleBtn("##gm", "God Mode  ON", "God Mode OFF", &tog_godmode, bsz))
-                    log_ui("GodMode = %s", tog_godmode ? "ON" : "OFF");
-                ImGui::SameLine(0, 8);
-                if (ToggleBtn("##nc", "NoClip  ON", "NoClip  OFF", &tog_noclip, bsz))
-                    log_ui("NoClip = %s", tog_noclip ? "ON" : "OFF");
-
-                if (ToggleBtn("##ia", "InfAmmo  ON", "InfAmmo  OFF", &tog_infammo, bsz))
-                    log_ui("InfAmmo = %s", tog_infammo ? "ON" : "OFF");
-                ImGui::SameLine(0, 8);
-                if (ToggleBtn("##sh", "SpeedHack ON", "SpeedHack OFF", &tog_speedhack, bsz))
-                    log_ui("SpeedHack = %s", tog_speedhack ? "ON" : "OFF");
-
-                ImGui::Spacing();
-                ImGui::Text("Stats"); ImGui::Separator(); ImGui::Spacing();
-
+            if(ImGui::BeginTabItem("Player")){
+                ImGui::Spacing(); ImGui::Text("Toggles"); ImGui::Separator(); ImGui::Spacing();
+                float hw=(ImGui::GetContentRegionAvail().x-8)*.5f;
+                if(TogBtn("GodMode ON","GodMode OFF",&tog_godmode,{hw,0})) log_ui("GodMode=%s",tog_godmode?"ON":"OFF");
+                ImGui::SameLine(0,8);
+                if(TogBtn("NoClip ON","NoClip OFF",&tog_noclip,{hw,0})) log_ui("NoClip=%s",tog_noclip?"ON":"OFF");
+                if(TogBtn("InfAmmo ON","InfAmmo OFF",&tog_infammo,{hw,0})) log_ui("InfAmmo=%s",tog_infammo?"ON":"OFF");
+                ImGui::SameLine(0,8);
+                if(TogBtn("Speed ON","Speed OFF",&tog_speed,{hw,0})) log_ui("Speed=%s",tog_speed?"ON":"OFF");
+                ImGui::Spacing(); ImGui::Text("Stats"); ImGui::Separator(); ImGui::Spacing();
                 ImGui::Text("HP    "); ImGui::SameLine(60); ImGui::SetNextItemWidth(-1);
-                if (ImGui::SliderInt("##hp", &sl_health, 0, 100))
-                    log_ui("HP = %d", sl_health);
-
+                if(ImGui::SliderInt("##hp",&sl_health,0,100)) log_ui("HP=%d",sl_health);
                 ImGui::Text("Armor "); ImGui::SameLine(60); ImGui::SetNextItemWidth(-1);
-                if (ImGui::SliderInt("##ar", &sl_armor, 0, 100))
-                    log_ui("Armor = %d", sl_armor);
-
+                if(ImGui::SliderInt("##ar",&sl_armor,0,100)) log_ui("Armor=%d",sl_armor);
                 ImGui::Text("Speed "); ImGui::SameLine(60); ImGui::SetNextItemWidth(-1);
-                if (ImGui::SliderFloat("##sp", &sl_speed, 0.1f, 5.0f, "%.2fx"))
-                    log_ui("Speed = %.2f", sl_speed);
-
+                if(ImGui::SliderFloat("##sp",&sl_spd,.1f,5.f,"%.2fx")) log_ui("Speed=%.2f",sl_spd);
                 ImGui::Text("FOV   "); ImGui::SameLine(60); ImGui::SetNextItemWidth(-1);
-                if (ImGui::SliderFloat("##fv", &sl_fov, 40, 120, "%.0f deg"))
-                    log_ui("FOV = %.0f", sl_fov);
-
-                ImGui::Spacing();
-                ImGui::Text("Features"); ImGui::Separator(); ImGui::Spacing();
-
-                if (ImGui::Checkbox("ESP",        &cb_esp))    log_ui("ESP = %d",    cb_esp);
-                if (ImGui::Checkbox("Aimbot",     &cb_aimbot)) log_ui("Aimbot = %d", cb_aimbot);
-                if (ImGui::Checkbox("Show Radar", &cb_radar))  log_ui("Radar = %d",  cb_radar);
-                if (ImGui::Checkbox("Show HUD",   &cb_hud))    log_ui("HUD = %d",    cb_hud);
-
+                if(ImGui::SliderFloat("##fv",&sl_fov,40,120,"%.0fdeg")) log_ui("FOV=%.0f",sl_fov);
+                ImGui::Spacing(); ImGui::Text("Features"); ImGui::Separator(); ImGui::Spacing();
+                if(ImGui::Checkbox("ESP",&cb_esp)) log_ui("ESP=%d",cb_esp);
+                if(ImGui::Checkbox("Show Radar",&cb_radar)) log_ui("Radar=%d",cb_radar);
+                if(ImGui::Checkbox("Show HUD",&cb_hud)) log_ui("HUD=%d",cb_hud);
                 ImGui::EndTabItem();
             }
 
-            // ══ TAB: WEAPON ══════════════════════════════════════════════
-            if (ImGui::BeginTabItem("Weapon")) {
-                ImGui::Spacing();
-                ImGui::Text("Weapon"); ImGui::Separator(); ImGui::Spacing();
-
-                ImGui::SetNextItemWidth(-1);
-                ImGui::Combo("##wep", &combo_wep, k_weapons, IM_ARRAYSIZE(k_weapons));
-
-                ImGui::Spacing();
-                float bw = ImGui::GetContentRegionAvail().x;
-                if (ImGui::Button("Give Weapon", ImVec2(bw, 0)))
-                    log_ui("Give: %s", k_weapons[combo_wep]);
-                if (ImGui::Button("Remove All Weapons", ImVec2(bw, 0)))
-                    log_ui("Removed all weapons");
-
-                ImGui::Spacing();
-                ImGui::Text("Ammo"); ImGui::Separator(); ImGui::Spacing();
-
-                ImGui::SetNextItemWidth(-1);
-                ImGui::SliderInt("##ammo", &sl_ammo, 0, 9999);
-                if (ImGui::Checkbox("Infinite Ammo", &cb_infammo_wep))
-                    log_ui("InfAmmo = %d", cb_infammo_wep);
-                if (ImGui::Button("Set Ammo", ImVec2(bw, 0)))
-                    log_ui("Ammo set %d for %s", sl_ammo, k_weapons[combo_wep]);
-
+            if(ImGui::BeginTabItem("Weapon")){
+                ImGui::Spacing(); ImGui::SetNextItemWidth(-1);
+                ImGui::Combo("##wep",&combo_wep,k_wep,IM_ARRAYSIZE(k_wep));
+                float bw=ImGui::GetContentRegionAvail().x;
+                if(ImGui::Button("Give Weapon",{bw,0})) log_ui("Give: %s",k_wep[combo_wep]);
+                if(ImGui::Button("Remove All",{bw,0})) log_ui("Removed all");
+                ImGui::Spacing(); ImGui::SetNextItemWidth(-1);
+                ImGui::SliderInt("##ammo",&sl_ammo,0,9999);
+                if(ImGui::Button("Set Ammo",{bw,0})) log_ui("Ammo %d -> %s",sl_ammo,k_wep[combo_wep]);
                 ImGui::EndTabItem();
             }
 
-            // ══ TAB: TELEPORT ═════════════════════════════════════════════
-            if (ImGui::BeginTabItem("Teleport")) {
+            if(ImGui::BeginTabItem("Teleport")){
                 ImGui::Spacing();
-                ImGui::Text("Coordinates"); ImGui::Separator(); ImGui::Spacing();
-
-                ImGui::Text("X "); ImGui::SameLine(30); ImGui::SetNextItemWidth(-1);
-                ImGui::InputFloat("##tx", &tp_x, 1.0f, 10.0f, "%.2f");
-
-                ImGui::Text("Y "); ImGui::SameLine(30); ImGui::SetNextItemWidth(-1);
-                ImGui::InputFloat("##ty", &tp_y, 1.0f, 10.0f, "%.2f");
-
-                ImGui::Text("Z "); ImGui::SameLine(30); ImGui::SetNextItemWidth(-1);
-                ImGui::InputFloat("##tz", &tp_z, 0.5f, 5.0f, "%.2f");
-
-                ImGui::Spacing();
-                float bw = ImGui::GetContentRegionAvail().x;
-                if (ImGui::Button("Teleport", ImVec2(bw, 0)))
-                    log_ui("Teleport -> %.2f %.2f %.2f", tp_x, tp_y, tp_z);
-
-                ImGui::Spacing(); ImGui::Separator();
-                if (ImGui::Checkbox("Freeze Position", &cb_freeze))
-                    log_ui("Freeze = %d", cb_freeze);
-
-                ImGui::Spacing();
-                ImGui::Text("Quick TP"); ImGui::Separator(); ImGui::Spacing();
-
-                struct { const char* name; float x,y,z; } spots[] = {
-                    {"Grove Street",   2495.0f, -1688.0f, 13.3f},
-                    {"LS Airport",    -1400.0f,  -200.0f, 14.0f},
-                    {"Las Venturas",   2000.0f,  1000.0f, 10.0f},
-                    {"San Fierro",    -1982.0f,   138.0f, 27.0f},
-                };
-                for (auto& s : spots) {
-                    if (ImGui::Button(s.name, ImVec2(bw, 0))) {
-                        tp_x = s.x; tp_y = s.y; tp_z = s.z;
-                        log_ui("Quick TP: %s", s.name);
-                    }
-                }
-
+                ImGui::Text("X"); ImGui::SameLine(20); ImGui::SetNextItemWidth(-1); ImGui::InputFloat("##tx",&tp_x,1,10,"%.2f");
+                ImGui::Text("Y"); ImGui::SameLine(20); ImGui::SetNextItemWidth(-1); ImGui::InputFloat("##ty",&tp_y,1,10,"%.2f");
+                ImGui::Text("Z"); ImGui::SameLine(20); ImGui::SetNextItemWidth(-1); ImGui::InputFloat("##tz",&tp_z,.5f,5,"%.2f");
+                float bw=ImGui::GetContentRegionAvail().x;
+                if(ImGui::Button("Teleport",{bw,0})) log_ui("TP -> %.2f %.2f %.2f",tp_x,tp_y,tp_z);
+                ImGui::Separator();
+                if(ImGui::Checkbox("Freeze",&cb_freeze)) log_ui("Freeze=%d",cb_freeze);
+                ImGui::Spacing(); ImGui::Text("Quick TP"); ImGui::Separator(); ImGui::Spacing();
+                struct {const char*n;float x,y,z;}sp[]={
+                    {"Grove St",2495,-1688,13.3f},{"LS Airport",-1400,-200,14},
+                    {"Las Venturas",2000,1000,10},{"San Fierro",-1982,138,27}};
+                for(auto&s:sp) if(ImGui::Button(s.n,{bw,0})){tp_x=s.x;tp_y=s.y;tp_z=s.z;log_ui("TP: %s",s.n);}
                 ImGui::EndTabItem();
             }
 
-            // ══ TAB: VISUAL ═══════════════════════════════════════════════
-            if (ImGui::BeginTabItem("Visual")) {
-                ImGui::Spacing();
-
-                if (ImGui::Checkbox("Fullbright",   &cb_fullbright))
-                    log_ui("Fullbright = %d",   cb_fullbright);
-                if (ImGui::Checkbox("Night Vision", &cb_nightvision))
-                    log_ui("NightVision = %d",  cb_nightvision);
-
+            if(ImGui::BeginTabItem("Visual")){
                 ImGui::Spacing();
                 ImGui::Text("UI Alpha"); ImGui::SameLine(80); ImGui::SetNextItemWidth(-1);
-                ImGui::SliderFloat("##uia", &sl_ui_alpha, 0.2f, 1.0f, "%.2f");
-
-                ImGui::Spacing();
-                ImGui::Text("ESP Color");
-                ImGui::SetNextItemWidth(-1);
-                ImGui::ColorEdit4("##ce", col_esp,
-                    ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueBar);
-
-                ImGui::Text("Name Color");
-                ImGui::SetNextItemWidth(-1);
-                ImGui::ColorEdit4("##cn", col_name,
-                    ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueBar);
-
-                ImGui::Spacing();
-                ImGui::Text("Team"); ImGui::Separator(); ImGui::Spacing();
-                ImGui::RadioButton("None",  &radio_team, 0); ImGui::SameLine();
-                ImGui::RadioButton("Alpha", &radio_team, 1); ImGui::SameLine();
-                ImGui::RadioButton("Beta",  &radio_team, 2); ImGui::SameLine();
-                ImGui::RadioButton("Grove", &radio_team, 3);
-
+                ImGui::SliderFloat("##a",&sl_alpha,.2f,1.f,"%.2f");
+                ImGui::Text("ESP Color"); ImGui::SetNextItemWidth(-1);
+                ImGui::ColorEdit4("##ce",col_esp,ImGuiColorEditFlags_NoInputs|ImGuiColorEditFlags_PickerHueBar);
                 ImGui::EndTabItem();
             }
 
-            // ══ TAB: CONSOLE ══════════════════════════════════════════════
-            if (ImGui::BeginTabItem("Console")) {
+            if(ImGui::BeginTabItem("Console")){
                 ImGui::Spacing();
-
-                float log_h = ImGui::GetContentRegionAvail().y - 56;
-                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.05f, 0.07f, 1));
-                ImGui::BeginChild("##logwnd", ImVec2(-1, log_h), true);
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 1.0f, 0.75f, 1));
-                ImGui::TextUnformatted(g_log);
-                ImGui::PopStyleColor();
-                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-                    ImGui::SetScrollHereY(1.0f);
-                ImGui::EndChild();
-                ImGui::PopStyleColor();
-
+                float lh=ImGui::GetContentRegionAvail().y-56;
+                ImGui::PushStyleColor(ImGuiCol_ChildBg,{.05f,.05f,.07f,1});
+                ImGui::BeginChild("##lw",{-1,lh},true);
+                ImGui::PushStyleColor(ImGuiCol_Text,{.75f,1,.75f,1});
+                ImGui::TextUnformatted(g_log); ImGui::PopStyleColor();
+                if(ImGui::GetScrollY()>=ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1);
+                ImGui::EndChild(); ImGui::PopStyleColor();
                 ImGui::Spacing();
-                float bw = ImGui::GetContentRegionAvail().x;
-                ImGui::SetNextItemWidth(bw - 60);
-                bool enter = ImGui::InputText("##cons", g_cmd, sizeof(g_cmd),
-                    ImGuiInputTextFlags_EnterReturnsTrue);
+                float bw=ImGui::GetContentRegionAvail().x;
+                ImGui::SetNextItemWidth(bw-60);
+                bool enter=ImGui::InputText("##c",g_cmd,sizeof(g_cmd),ImGuiInputTextFlags_EnterReturnsTrue);
                 ImGui::SameLine();
-                if ((ImGui::Button("Run") || enter) && g_cmd[0]) {
-                    log_ui("> %s", g_cmd);
-                    g_cmd[0] = '\0';
-                }
-                if (ImGui::Button("Clear", ImVec2(bw, 0)))
-                    g_log[0] = '\0';
-
+                if((ImGui::Button("Run")||enter)&&g_cmd[0]){log_ui("> %s",g_cmd);g_cmd[0]=0;}
+                if(ImGui::Button("Clear",{bw,0})) g_log[0]=0;
                 ImGui::EndTabItem();
             }
 
@@ -465,231 +229,179 @@ static void render_gui() {
         }
         ImGui::End();
     }
-
 done:
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Init / Shutdown ImGui
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void do_shutdown() {
-    if (g_init) {
+// ── Init / Shutdown ──────────────────────────────────────────────────────────
+static void do_shutdown(){
+    if(g_init){
         ImGui_ImplOpenGL3_Shutdown();
         ImGui::DestroyContext();
-        g_init = false;
-        _log("[GUIAML] Context destroyed (context change)");
+        g_init=false;
+        _log("[GUIAML] Context destroyed");
     }
 }
 
-static void do_init(EGLDisplay dpy, EGLSurface surf) {
+static void do_init(EGLDisplay dpy, EGLSurface surf){
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImGuiIO& io=ImGui::GetIO();
+    io.IniFilename=nullptr;
 
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr;  // jangan buat file .ini
+    EGLint w=1080,h=1920;
+    eglQuerySurface(dpy,surf,EGL_WIDTH,&w);
+    eglQuerySurface(dpy,surf,EGL_HEIGHT,&h);
+    io.DisplaySize={float(w),float(h)};
 
-    EGLint w = 1080, h = 1920;
-    eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
-    eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-    io.DisplaySize = ImVec2((float)w, (float)h);
-
-    float sc = (float)w / 1080.0f * 2.2f;
-    io.FontGlobalScale = sc;
+    float sc=float(w)/1080.f*2.2f;
+    io.FontGlobalScale=sc;
 
     ImGui::StyleColorsDark();
-    ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding    = 6;   s.FrameRounding    = 4;
-    s.GrabRounding      = 3;   s.ScrollbarRounding = 4;
-    s.WindowBorderSize  = 1;   s.FrameBorderSize   = 0;
-    s.WindowPadding     = ImVec2(10, 10);
-    s.FramePadding      = ImVec2(6, 4);
-    s.ItemSpacing       = ImVec2(8, 6);
+    ImGuiStyle& s=ImGui::GetStyle();
+    s.WindowRounding=6; s.FrameRounding=4; s.GrabRounding=3;
+    s.WindowPadding={10,10}; s.FramePadding={6,4}; s.ItemSpacing={8,6};
 
-    ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg]         = ImVec4(0.04f, 0.05f, 0.07f, 0.96f);
-    c[ImGuiCol_TitleBg]          = ImVec4(0.07f, 0.16f, 0.13f, 1);
-    c[ImGuiCol_TitleBgActive]    = ImVec4(0.09f, 0.24f, 0.19f, 1);
-    c[ImGuiCol_Header]           = ImVec4(0.10f, 0.30f, 0.24f, 0.8f);
-    c[ImGuiCol_HeaderHovered]    = ImVec4(0.14f, 0.44f, 0.34f, 0.9f);
-    c[ImGuiCol_HeaderActive]     = ImVec4(0.17f, 0.52f, 0.41f, 1);
-    c[ImGuiCol_Button]           = ImVec4(0.09f, 0.26f, 0.20f, 0.9f);
-    c[ImGuiCol_ButtonHovered]    = ImVec4(0.13f, 0.40f, 0.30f, 1);
-    c[ImGuiCol_ButtonActive]     = ImVec4(0.07f, 0.20f, 0.15f, 1);
-    c[ImGuiCol_FrameBg]          = ImVec4(0.07f, 0.09f, 0.11f, 1);
-    c[ImGuiCol_FrameBgHovered]   = ImVec4(0.10f, 0.16f, 0.14f, 1);
-    c[ImGuiCol_SliderGrab]       = ImVec4(0.18f, 0.65f, 0.50f, 1);
-    c[ImGuiCol_SliderGrabActive] = ImVec4(0.22f, 0.85f, 0.65f, 1);
-    c[ImGuiCol_CheckMark]        = ImVec4(0.22f, 0.85f, 0.65f, 1);
-    c[ImGuiCol_Tab]              = ImVec4(0.07f, 0.16f, 0.12f, 1);
-    c[ImGuiCol_TabHovered]       = ImVec4(0.12f, 0.36f, 0.27f, 1);
-    c[ImGuiCol_TabActive]        = ImVec4(0.10f, 0.28f, 0.22f, 1);
-    c[ImGuiCol_Separator]        = ImVec4(0.15f, 0.30f, 0.24f, 0.6f);
-
+    ImVec4* c=s.Colors;
+    c[ImGuiCol_WindowBg]        ={.04f,.05f,.07f,.96f};
+    c[ImGuiCol_TitleBgActive]   ={.09f,.24f,.19f,1};
+    c[ImGuiCol_Button]          ={.09f,.26f,.20f,.9f};
+    c[ImGuiCol_ButtonHovered]   ={.13f,.40f,.30f,1};
+    c[ImGuiCol_SliderGrab]      ={.18f,.65f,.50f,1};
+    c[ImGuiCol_SliderGrabActive]={.22f,.85f,.65f,1};
+    c[ImGuiCol_CheckMark]       ={.22f,.85f,.65f,1};
+    c[ImGuiCol_Tab]             ={.07f,.16f,.12f,1};
+    c[ImGuiCol_TabHovered]      ={.12f,.36f,.27f,1};
+    c[ImGuiCol_TabActive]       ={.10f,.28f,.22f,1};
     s.ScaleAllSizes(sc);
 
     ImGui_ImplOpenGL3_Init("#version 100");
-
-    g_init = true;
-    _log("[GUIAML] ImGui init OK %dx%d scale=%.2f", w, h, sc);
+    g_init=true;
+    _log("[GUIAML] ImGui init OK %dx%d scale=%.2f",w,h,sc);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  [FIX #4] eglSwapBuffers hook — save/restore GL state dengan benar
-// ─────────────────────────────────────────────────────────────────────────────
+// ── eglSwapBuffers hook ──────────────────────────────────────────────────────
+static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf){
+    EGLContext ctx=eglGetCurrentContext();
 
-static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    EGLContext ctx = eglGetCurrentContext();
-
-    // Context berubah (transisi loading→game world) → re-init ImGui
-    if (ctx != g_last_context || dpy != g_last_display || surf != g_last_surface) {
+    if(ctx!=g_last_ctx||dpy!=g_last_dpy||surf!=g_last_surf){
         do_shutdown();
-        g_last_display = dpy;
-        g_last_surface = surf;
-        g_last_context = ctx;
+        g_last_dpy=dpy; g_last_surf=surf; g_last_ctx=ctx;
     }
 
-    if (!g_init && ctx != EGL_NO_CONTEXT) {
-        do_init(dpy, surf);
-    }
+    if(!g_init&&ctx!=EGL_NO_CONTEXT) do_init(dpy,surf);
 
-    if (g_init) {
-        // ── Simpan GL state penting ───────────────────────────────────────
-        GLint prev_fbo        = 0;
-        GLint prev_viewport[4] = {};
-        GLboolean prev_depth  = glIsEnabled(GL_DEPTH_TEST);
-        GLboolean prev_cull   = glIsEnabled(GL_CULL_FACE);
-        GLboolean prev_blend  = glIsEnabled(GL_BLEND);
-        GLboolean prev_scissor = glIsEnabled(GL_SCISSOR_TEST);
-        GLint prev_blend_src  = 0, prev_blend_dst = 0;
+    if(g_init){
+        GLint pfbo=0, pvp[4]={};
+        GLboolean pd=glIsEnabled(GL_DEPTH_TEST);
+        GLboolean pc=glIsEnabled(GL_CULL_FACE);
+        GLboolean pb=glIsEnabled(GL_BLEND);
+        GLboolean ps=glIsEnabled(GL_SCISSOR_TEST);
+        GLint bsrc=0,bdst=0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING,&pfbo);
+        glGetIntegerv(GL_VIEWPORT,pvp);
+        glGetIntegerv(GL_BLEND_SRC_ALPHA,&bsrc);
+        glGetIntegerv(GL_BLEND_DST_ALPHA,&bdst);
 
-        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
-        glGetIntegerv(GL_VIEWPORT,            prev_viewport);
-        glGetIntegerv(GL_BLEND_SRC_ALPHA,     &prev_blend_src);
-        glGetIntegerv(GL_BLEND_DST_ALPHA,     &prev_blend_dst);
+        EGLint w=1080,h=1920;
+        eglQuerySurface(dpy,surf,EGL_WIDTH,&w);
+        eglQuerySurface(dpy,surf,EGL_HEIGHT,&h);
 
-        // ── Set state yang dibutuhkan ImGui ───────────────────────────────
-        EGLint w = 1080, h = 1920;
-        eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
-        eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(0, 0, w, h);
-
-        glDisable(GL_DEPTH_TEST);
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_SCISSOR_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-        // Update DisplaySize kalau surface berubah
-        ImGui::GetIO().DisplaySize = ImVec2((float)w, (float)h);
+        glBindFramebuffer(GL_FRAMEBUFFER,0);
+        glViewport(0,0,w,h);
+        glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+        glDisable(GL_SCISSOR_TEST); glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+        ImGui::GetIO().DisplaySize={float(w),float(h)};
 
         render_gui();
 
-        // ── Restore GL state ──────────────────────────────────────────────
-        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
-        glViewport(prev_viewport[0], prev_viewport[1],
-                   prev_viewport[2], prev_viewport[3]);
-
-        if (prev_depth)   glEnable(GL_DEPTH_TEST);   else glDisable(GL_DEPTH_TEST);
-        if (prev_cull)    glEnable(GL_CULL_FACE);    else glDisable(GL_CULL_FACE);
-        if (prev_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-        if (prev_blend)   glEnable(GL_BLEND);        else glDisable(GL_BLEND);
-        glBlendFunc((GLenum)prev_blend_src, (GLenum)prev_blend_dst);
+        glBindFramebuffer(GL_FRAMEBUFFER,(GLuint)pfbo);
+        glViewport(pvp[0],pvp[1],pvp[2],pvp[3]);
+        if(pd) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+        if(pc) glEnable(GL_CULL_FACE);  else glDisable(GL_CULL_FACE);
+        if(ps) glEnable(GL_SCISSOR_TEST);else glDisable(GL_SCISSOR_TEST);
+        if(pb) glEnable(GL_BLEND);      else glDisable(GL_BLEND);
+        glBlendFunc((GLenum)bsrc,(GLenum)bdst);
     }
 
-    return orig_eglSwapBuffers(dpy, surf);
+    return orig_eglSwapBuffers(dpy,surf);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Public API
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Public: inject touch dari luar (misal JNI hook) ─────────────────────────
+extern "C" EXPORT void guiaml_touch(float x, float y, int action){
+    // Dipanggil dari hook eksternal jika ada
+    // Juga bisa dipanggil dari Lua via FFI jika dibutuhkan
+    if(!g_init) return;
 
-extern "C" EXPORT void guiaml_toggle() { g_visible = !g_visible; }
+    pthread_mutex_lock(&g_tmu);
+    g_touch={x,y,action,true};
+    pthread_mutex_unlock(&g_tmu);
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  AML entry points
-// ─────────────────────────────────────────────────────────────────────────────
+    // Jika ImGui mau capture, informasikan ke caller (return tidak dipakai di void)
+    // Caller cek WantCaptureMouse setelah inject
+}
 
+extern "C" EXPORT bool guiaml_wants_touch(){
+    // Dipanggil dari hook touch eksternal untuk cek apakah harus di-consume
+    if(!g_init||!g_visible) return false;
+    return ImGui::GetIO().WantCaptureMouse;
+}
+
+extern "C" EXPORT void guiaml_toggle(){ g_visible=!g_visible; }
+
+// ── AML entry ────────────────────────────────────────────────────────────────
 extern "C" {
 
-EXPORT void* __GetModInfo() {
-    static const char* i = "guiaml|1.1|ImGui Overlay (fixed touch)|brruham-arch";
+EXPORT void* __GetModInfo(){
+    static const char* i="guiaml|1.2|ImGui Overlay (no touch hook crash)|brruham-arch";
     return (void*)i;
 }
 
-EXPORT void OnModPreLoad() {
+EXPORT void OnModPreLoad(){
     remove(LOGFILE);
-    _log("[GUIAML] OnModPreLoad v1.1");
-    g_init    = false;
-    g_visible = true;
-    g_touch   = {};
+    _log("[GUIAML] OnModPreLoad v1.2");
+    g_init=false; g_visible=true; g_touch={};
 }
 
-EXPORT void OnModLoad() {
-    _log("[GUIAML] OnModLoad");
+EXPORT void OnModLoad(){
+    _log("[GUIAML] OnModLoad v1.2");
 
-    // ── Load Dobby ────────────────────────────────────────────────────────
-    void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hDobby) { _log("[GUIAML] ERROR: libdobby.so tidak ditemukan: %s", dlerror()); return; }
+    void* hD=dlopen("libdobby.so",RTLD_NOW|RTLD_GLOBAL);
+    if(!hD){_log("[GUIAML] ERROR: libdobby.so: %s",dlerror());return;}
 
-    auto fnHook     = (DobbyHook_t)     dlsym(hDobby, "DobbyHook");
-    auto fnResolver = (DobbyResolver_t) dlsym(hDobby, "DobbySymbolResolver");
-    if (!fnHook) { _log("[GUIAML] ERROR: DobbyHook tidak ditemukan"); return; }
+    auto fnH=(DobbyHook_t)    dlsym(hD,"DobbyHook");
+    auto fnR=(DobbyResolver_t)dlsym(hD,"DobbySymbolResolver");
+    if(!fnH){_log("[GUIAML] ERROR: DobbyHook");return;}
 
-    // ── Hook eglSwapBuffers ───────────────────────────────────────────────
-    void* addr_egl = nullptr;
-    if (fnResolver) addr_egl = fnResolver("libEGL.so", "eglSwapBuffers");
-    if (!addr_egl) {
-        void* hEGL = dlopen("libEGL.so", RTLD_NOW | RTLD_NOLOAD);
-        if (hEGL) { addr_egl = dlsym(hEGL, "eglSwapBuffers"); dlclose(hEGL); }
+    // ── Hook eglSwapBuffers ──────────────────────────────────────────────
+    void* aEGL=nullptr;
+    if(fnR) aEGL=fnR("libEGL.so","eglSwapBuffers");
+    if(!aEGL){
+        void* hE=dlopen("libEGL.so",RTLD_NOW|RTLD_NOLOAD);
+        if(hE){aEGL=dlsym(hE,"eglSwapBuffers");dlclose(hE);}
     }
-    if (!addr_egl) { _log("[GUIAML] ERROR: eglSwapBuffers tidak ditemukan"); return; }
-    _log("[GUIAML] eglSwapBuffers @ %p", addr_egl);
+    if(!aEGL){_log("[GUIAML] ERROR: eglSwapBuffers addr");return;}
+    _log("[GUIAML] eglSwapBuffers @ %p",aEGL);
 
-    if (fnHook(addr_egl, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers) != 0) {
-        _log("[GUIAML] ERROR: hook eglSwapBuffers gagal");
-        return;
+    if(fnH(aEGL,(void*)hook_eglSwapBuffers,(void**)&orig_eglSwapBuffers)!=0){
+        _log("[GUIAML] ERROR: hook eglSwapBuffers gagal");return;
     }
     _log("[GUIAML] eglSwapBuffers hooked OK");
 
-    // ── Hook AND_TouchEvent — cari base libGTASA.so dari /proc/self/maps ─
-    uintptr_t gtasa_base = 0;
-    {
-        FILE* maps = fopen("/proc/self/maps", "r");
-        if (maps) {
-            char line[512];
-            while (fgets(line, sizeof(line), maps)) {
-                if (strstr(line, "libGTASA.so") && strstr(line, "r-xp")) {
-                    gtasa_base = (uintptr_t)strtoul(line, nullptr, 16);
-                    break;
-                }
-            }
-            fclose(maps);
-        }
-    }
-    _log("[GUIAML] libGTASA.so base = 0x%08X", (uint32_t)gtasa_base);
+    // ── AND_TouchEvent: TIDAK di-hook langsung (SIGILL di offset lama) ───
+    // Offset 0x2697C0 ternyata bukan AND_TouchEvent atau terlalu kecil.
+    // Touch input akan masuk via guiaml_touch() dari hook eksternal,
+    // atau via Lua FFI jika diperlukan.
+    // Untuk sekarang: GUI tetap bisa dipakai, touch di area window
+    // akan di-block via WantCaptureMouse di frame berikutnya.
+    _log("[GUIAML] AND_TouchEvent hook DILEWATI (offset perlu diverifikasi ulang)");
+    _log("[GUIAML] Cara cari offset yang benar:");
+    _log("[GUIAML] nm libGTASA.so | grep -i touch  atau cek IDA/Ghidra");
+    _log("[GUIAML] libGTASA base = 0xE2FD0000");
 
-    if (gtasa_base) {
-        // PENTING: Sesuaikan offset ini dengan versi libGTASA.so kamu!
-        // Thumb2 function → berikan alamat genap ke Dobby (tanpa +1)
-        // Dobby sudah handle Thumb otomatis dari CPSR
-        // Offset contoh versi 2.00: 0x2697C0
-        // Verifikasi: nm libGTASA.so | grep AND_Touch  atau readelf -s
-        void* addr_touch = (void*)(gtasa_base + 0x2697C0);
-        _log("[GUIAML] AND_TouchEvent target = %p", addr_touch);
-
-        int rt = fnHook(addr_touch, (void*)hook_AND_TouchEvent, (void**)&orig_AND_TouchEvent);
-        if (rt == 0) _log("[GUIAML] AND_TouchEvent hooked OK");
-        else         _log("[GUIAML] WARN: AND_TouchEvent hook failed r=%d (cek offset!)", rt);
-    } else {
-        _log("[GUIAML] WARN: libGTASA.so base tidak ditemukan di /proc/self/maps");
-    }
-
-    _log("[GUIAML] Siap — GUI aktif di frame pertama eglSwapBuffers");
+    _log("[GUIAML] Siap — GUI aktif, touch blocking via WantCaptureMouse");
 }
 
 } // extern "C"
