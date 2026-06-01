@@ -10,10 +10,12 @@ LOCAL_SRC_FILES := \
     ../include/imgui/imgui_draw.cpp \
     ../include/imgui/imgui_tables.cpp \
     ../include/imgui/imgui_widgets.cpp \
-    ../include/imgui/imgui_impl_opengl3.cpp
+    ../include/imgui/backends/imgui_impl_opengl3.cpp
 
 LOCAL_C_INCLUDES := \
-    $(LOCAL_PATH)/../include
+    $(LOCAL_PATH)/../include \
+    $(LOCAL_PATH)/../include/imgui \
+    $(LOCAL_PATH)/../include/imgui/backends
 
 LOCAL_CPPFLAGS := \
     -std=c++17 \
@@ -23,6 +25,6 @@ LOCAL_CPPFLAGS := \
     -DIMGUI_DISABLE_DEBUG_TOOLS \
     -DIMGUI_IMPL_OPENGL_ES2
 
-LOCAL_LDLIBS := -llog -ldl -landroid -lEGL -lGLESv2
+LOCAL_LDLIBS := -llog -ldl -android -lEGL -lGLESv2
 
 include $(BUILD_SHARED_LIBRARY)
